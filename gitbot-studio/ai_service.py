@@ -10,7 +10,8 @@ from google import genai
 load_dotenv()
 
 MODEL = "gemini-2.5-flash"
-client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+api_key = os.getenv("GEMINI_API_KEY", "").strip()
+client = genai.Client(api_key=api_key) if api_key else None
 
 
 def _context(repo_data: dict[str, Any]) -> str:
