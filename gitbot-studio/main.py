@@ -1,6 +1,9 @@
 """FastAPI application for GitBot Studio."""
 
 from pathlib import Path
+import logging
+import os
+import time
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
@@ -12,6 +15,9 @@ from ai_service import ask_repo_question, generate_blueprint
 from github_service import inspect_repository, parse_repo_url
 
 BASE_DIR = Path(__file__).resolve().parent
+logger = logging.getLogger(__name__)
+CACHE_TTL_SECONDS = 15 * 60
+CACHE_MAX_ENTRIES = 64
 REPO_CACHE: dict[str, dict[str, Any]] = {}
 
 app = FastAPI(title="GitBot Studio", version="1.0.0")
@@ -25,7 +31,7 @@ class InspectRequest(BaseModel):
 class ChatRequest(BaseModel):
     repo_url: str = Field(min_length=1)
     question: str = Field(min_length=1, max_length=4000)
-    history: list[dict[str, Any]] = Field(default_factory=list)
+    history: list[dict[str, Any]] = Field(default_factory=list, max_length=20)
 
 
 def _cache_key(repo_url: str) -> str:
@@ -38,20 +44,48 @@ def index() -> FileResponse:
     return FileResponse(BASE_DIR / "static" / "index.html")
 
 
+@app.get("/api/health")
+def health() -> dict[str, str | bool]:
+    """Report application and optional AI configuration status."""
+    return {"status": "ok", "gemini_configured": bool(os.getenv("GEMINI_API_KEY", "").strip())}
+
+
+def _cached(key: str) -> dict[str, Any] | None:
+    entry = REPO_CACHE.get(key)
+    if not entry:
+        return None
+    if time.monotonic() - entry["created_at"] >= CACHE_TTL_SECONDS:
+        REPO_CACHE.pop(key, None)
+        return None
+    return entry
+
+
 @app.post("/api/inspect")
 def inspect(request: InspectRequest) -> dict[str, Any]:
     try:
         key = _cache_key(request.repo_url)
-        if key not in REPO_CACHE:
+        cached = _cached(key)
+        was_cached = cached is not None
+        if not cached:
             data = inspect_repository(request.repo_url)
-            REPO_CACHE[key] = {"data": data, "blueprint": generate_blueprint(data)}
-        cached = REPO_CACHE[key]
+            cached = {"data": data, "blueprint": generate_blueprint(data), "created_at": time.monotonic()}
+            if len(REPO_CACHE) >= CACHE_MAX_ENTRIES:
+                oldest = min(REPO_CACHE, key=lambda item: REPO_CACHE[item]["created_at"])
+                REPO_CACHE.pop(oldest, None)
+            REPO_CACHE[key] = cached
         repo = cached["data"]["repository"]
-        return {"blueprint": cached["blueprint"], "stats": repo, "cached": key in REPO_CACHE}
+        return {
+            "blueprint": cached["blueprint"],
+            "stats": repo,
+            "tree": cached["data"]["tree"],
+            "tree_truncated": cached["data"]["tree_truncated"],
+            "cached": was_cached,
+        }
     except (ValueError, ConnectionError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Repository inspection failed: {exc}") from exc
+        logger.exception("Repository inspection failed")
+        raise HTTPException(status_code=502, detail="Repository inspection failed. Check the repository URL and service connectivity.") from exc
 
 
 @app.post("/api/chat")
@@ -60,11 +94,12 @@ def chat(request: ChatRequest) -> dict[str, str]:
         key = _cache_key(request.repo_url)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    cached = REPO_CACHE.get(key)
+    cached = _cached(key)
     if not cached:
         raise HTTPException(status_code=409, detail="Analyze this repository before starting a chat.")
     try:
         answer = ask_repo_question(cached["data"], request.history, request.question)
         return {"answer": answer}
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Chat request failed: {exc}") from exc
+        logger.exception("Repository chat failed")
+        raise HTTPException(status_code=502, detail="Chat request failed. Please try again.") from exc
